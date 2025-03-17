@@ -18,11 +18,14 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model import MiniMindLM
 from model.LMConfig import LMConfig
 from model.dataset import SFTDataset
+from eval_model import get_args as get_args4eval
+from eval_model import main as main4eval
+import deepspeed
 
 warnings.filterwarnings('ignore')
 
 
-def Logger(content):
+def Logger(content, ddp=None):
     if not ddp or dist.get_rank() == 0:
         print(content)
 
@@ -31,10 +34,21 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
-def train_epoch(epoch, wandb):
+def train_epoch(epoch, wandb,
+                train_loader,
+                iter_per_epoch,
+                optimizer,
+                ctx,
+                model,
+                scaler,
+                ddp,
+                lm_config,
+                ):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
+        if args.debug_step and step > args.debug_step:
+            break
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
@@ -94,20 +108,28 @@ def train_epoch(epoch, wandb):
             torch.save(state_dict, ckp)
             model.train()
 
+        if step and args.eval_interval and step % args.eval_interval == 0 and (not ddp or dist.get_rank() == 0):
+            eval_args = get_args4eval()
+            eval_args.max_seq_len = args.max_seq_len
+            eval_args.model_mode = 1  # 0: 预训练模型，1: SFT-Chat模型，2: RLHF-Chat模型，3: Reason模型
+            eval_args.use_deepspeed = args.use_deepspeed
+            eval_args.dtype = args.dtype
+            main4eval(eval_args)
 
-def init_model(lm_config):
+
+def init_model(lm_config, ddp):
     tokenizer = AutoTokenizer.from_pretrained('./model/minimind_tokenizer')
     model = MiniMindLM(lm_config)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp = f'./out/pretrain_{lm_config.dim}{moe_path}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
     model.load_state_dict(state_dict, strict=False)
-    Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
+    Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万', ddp)
     model = model.to(args.device)
     return model, tokenizer
 
 
-def init_distributed_mode():
+def init_distributed_mode(ddp):
     if not ddp: return
     global ddp_local_rank, DEVICE
 
@@ -117,33 +139,11 @@ def init_distributed_mode():
     ddp_world_size = int(os.environ["WORLD_SIZE"])
     DEVICE = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(DEVICE)
+    print(f'init_distributed_mode: ddp_local_rank={ddp_local_rank}, DEVICE={DEVICE}')
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMind Full SFT")
-    parser.add_argument("--out_dir", type=str, default="out")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT")
-    parser.add_argument("--num_workers", type=int, default=1)
-    parser.add_argument("--ddp", action="store_true")
-    parser.add_argument("--accumulation_steps", type=int, default=1)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--warmup_iters", type=int, default=0)
-    parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--save_interval", type=int, default=100)
-    parser.add_argument('--local_rank', type=int, default=-1)
-    parser.add_argument('--dim', default=512, type=int)
-    parser.add_argument('--n_layers', default=8, type=int)
-    parser.add_argument('--max_seq_len', default=512, type=int)
-    parser.add_argument('--use_moe', default=False, type=bool)
-    parser.add_argument("--data_path", type=str, default="./dataset/sft_mini_512.jsonl")
-
-    args = parser.parse_args()
+def main(args):
+    print(f'args: {args}')
 
     lm_config = LMConfig(dim=args.dim, n_layers=args.n_layers, max_seq_len=args.max_seq_len, use_moe=args.use_moe)
     args.save_dir = os.path.join(args.out_dir)
@@ -156,10 +156,16 @@ if __name__ == "__main__":
     args.wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
+
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
+    global ddp_local_rank, DEVICE
     ddp_local_rank, DEVICE = 0, "cuda:0"
+    print('ddp:', ddp, os.environ.get("RANK", -1))
+
     if ddp:
-        init_distributed_mode()
+        print(f'before init_distributed_mode: ddp_local_rank={ddp_local_rank}, DEVICE={DEVICE}')
+        init_distributed_mode(ddp)
+        print(f'after  init_distributed_mode: ddp_local_rank={ddp_local_rank}, DEVICE={DEVICE}')
         args.device = torch.device(DEVICE)
 
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
@@ -169,7 +175,7 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer = init_model(lm_config)
+    model, tokenizer = init_model(lm_config, ddp)
 
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
@@ -184,12 +190,87 @@ if __name__ == "__main__":
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    base_optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
-    if ddp:
+    if args.use_deepspeed:
+        ds_config = {
+            "zero_optimization": {"stage": args.zero_stage},
+            "train_batch_size": args.batch_size * args.accumulation_steps,
+            "gradient_accumulation_steps": args.accumulation_steps,
+            # Removed fixed fp16 setting to allow conditional configuration
+            "pipeline": {
+                "stages": 1,
+                "async_io": True,
+                "overlap_comm": True,
+                "pipeline_micro_batches": 4  # set number of micro-batches
+            }
+        }
+        if args.dtype == 'bfloat16':
+            ds_config["bf16"] = {"enabled": True}
+        elif args.dtype == 'float16':
+            ds_config["fp16"] = {"enabled": True}
+        model, base_optimizer, _, _ = deepspeed.initialize(args=args,
+                                                           model=model,
+                                                           optimizer=base_optimizer,
+                                                           config=ds_config)
+
+    elif ddp:
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
+        print('DistributedDataParallel:', ddp_local_rank)
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
-        train_epoch(epoch, wandb)
+        train_epoch(epoch, wandb, 
+                train_loader,
+                iter_per_epoch,
+                base_optimizer,
+                ctx,
+                model,
+                scaler,
+                ddp,
+                lm_config)
+        eval_args = get_args4eval()
+        eval_args.max_seq_len = args.max_seq_len
+        eval_args.model_mode = 1  # 0: 预训练模型，1: SFT-Chat模型，2: RLHF-Chat模型，3: Reason模型
+        eval_args.use_deepspeed = args.use_deepspeed
+        eval_args.dtype = args.dtype
+        main4eval(eval_args)
+    del model, tokenizer
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description="MiniMind Full SFT")
+    parser.add_argument("--out_dir", type=str, default="out")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT")
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--warmup_iters", type=int, default=0)
+    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--eval_interval", type=int, default=10)
+    parser.add_argument('--local_rank', type=int, default=-1)
+    parser.add_argument('--dim', default=512, type=int)
+    parser.add_argument('--n_layers', default=8, type=int)
+    parser.add_argument('--max_seq_len', default=512, type=int)
+    parser.add_argument('--use_moe', default=False, type=bool)
+    parser.add_argument('--debug_step', default=0, type=int)
+    parser.add_argument("--data_path", type=str, default="./dataset/sft_mini_512.jsonl")
+    parser.add_argument('--use_deepspeed', default=False, type=bool, help="Enable DeepSpeed pipeline")
+    parser.add_argument('--zero_stage', type=int, default=0, help="ZeRO optimization stage")
+
+    args = parser.parse_args()
+    return args
+
+
+if __name__ == "__main__":
+    args = get_args()
+    main(args)

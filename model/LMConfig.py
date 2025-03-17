@@ -1,6 +1,6 @@
 from transformers import PretrainedConfig
 from typing import List
-
+import os
 
 class LMConfig(PretrainedConfig):
     model_type = "minimind"
@@ -18,7 +18,9 @@ class LMConfig(PretrainedConfig):
             max_seq_len: int = 8192,
             rope_theta: int = 1e6,
             dropout: float = 0.0,
-            flash_attn: bool = True,
+            flash_attn: bool = False,
+            faiss_token: bool = False,
+            faiss_block: bool = True,
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
@@ -32,6 +34,12 @@ class LMConfig(PretrainedConfig):
             aux_loss_alpha: float = 0.1,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
+            window_size: int = 16,
+            block_size: int = 16,
+            top_n: int = 4,
+            M: int = 16,
+            ef_construction: int = 16,
+            ef_search: int = 8,
             **kwargs,
     ):
         self.dim = dim
@@ -58,4 +66,12 @@ class LMConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        self.window_size = window_size
+        self.block_size = block_size
+        self.faiss_token = faiss_token
+        self.faiss_block = faiss_block
+        self.top_n = top_n
+        self.M = M
+        self.ef_construction = ef_construction
+        self.ef_search = ef_search
         super().__init__(**kwargs)

@@ -3,7 +3,9 @@ import struct
 import inspect
 import time
 
-from .LMConfig import LMConfig
+from model.LMConfig import LMConfig
+from model.faiss_token_attention import faiss_token_attention
+from model.faiss_block_attention import faiss_block_attention
 from typing import Any, Optional, Tuple, List
 import numpy as np
 import torch
@@ -11,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
+import faiss
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float):
@@ -76,35 +78,130 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
-        # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-        mask = torch.triu(mask, diagonal=1)
-        self.register_buffer("mask", mask, persistent=False)
+        print('flash:', self.flash)
+        self.window_size = args.window_size
+        self.block_size = args.block_size
+        self.faiss_token = args.faiss_token
+        self.faiss_block = args.faiss_block
+        self.top_n = args.top_n
+        self.M = args.M
+        self.ef_construction = args.ef_construction
+        self.ef_search = args.ef_search
+        self.vec_indices = []
+        if args.faiss_token:
+            print('*' * 30)
+            print('faiss_token:', args.faiss_token)
+            print('top_n:', args.top_n)
+            print('M:', args.M)
+            print('ef_construction:', args.ef_construction)
+            print('ef_search:', args.ef_search)
+            print('window_size:', args.window_size)
+            print('block_size:', args.block_size)
+        if args.faiss_block:
+            print('*' * 30)
+            print('faiss_block:', args.faiss_block)
+            print('top_n:', args.top_n)
+            print('M:', args.M)
+            print('ef_construction:', args.ef_construction)
+            print('ef_search:', args.ef_search)
+            print('window_size:', args.window_size)
+            print('block_size:', args.block_size)
+        elif self.flash:
+            print('*' * 30)
+            print('flash')
+            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)
+            self.register_buffer("mask", mask, persistent=False)
+        else:
+            print('*' * 30)
+            print('default full attention')
+            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)
+            self.register_buffer("mask", mask, persistent=False)
 
     def forward(self,
                 x: torch.Tensor,
                 pos_cis: torch.Tensor,
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False):
-        bsz, seq_len, _ = x.shape
+        batch_size, seq_len, embed_dim = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
 
+        if xq.shape[1] == pos_cis.shape[0]:
+            xq, xk = apply_rotary_emb(xq, xk, pos_cis)
+        else:
+            xq = xq[:, -1:, :, :]
+            xk = xk[:, -1:, :, :]
+            xv = xv[:, -1:, :, :]
+            xq, xk = apply_rotary_emb(xq, xk, pos_cis)
         xq, xk = apply_rotary_emb(xq, xk, pos_cis)
         # kv_cache实现
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
+            if self.faiss_block:
+                xq = torch.cat([past_key_value[2], xq], dim=1)
         past_kv = (xk, xv) if use_cache else None
-
+        if self.faiss_block:
+            past_kv = (xk, xv, xq) if use_cache else None
+        seq_len4q = xq.shape[1]
         xq, xk, xv = (
             xq.transpose(1, 2),
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
-        if self.flash and seq_len != 1:
+        if self.faiss_token:
+            dropout_p = self.dropout if self.training else 0.0
+            if not self.vec_indices:
+                for i in range(batch_size):
+                    # 为当前批次创建 HNSW 索引
+                    index = faiss.IndexHNSWFlat(embed_dim, self.M, faiss.METRIC_INNER_PRODUCT)
+                    index.hnsw.efConstruction = self.ef_construction
+                    index.hnsw.efSearch = self.ef_search
+                    self.vec_indices.append(index)
+            if self.training:
+                for i in range(batch_size):
+                    self.vec_indices[i].reset()
+            if not self.training and past_key_value is None:
+                for i in range(batch_size):
+                    self.vec_indices[i].reset()
+            output = faiss_token_attention(
+                                    xq, xk, xv,
+                                    dropout_p=dropout_p,
+                                    window_size=self.window_size,
+                                    block_size=self.block_size,
+                                    top_n=self.top_n,
+                                    vec_indices=self.vec_indices,
+                                    training=self.training,
+                                    )
+        elif self.faiss_block:
+            dropout_p = self.dropout if self.training else 0.0
+            if not self.vec_indices:
+                for i in range(batch_size):
+                    # 为当前批次创建 HNSW 索引
+                    index = faiss.IndexHNSWFlat(embed_dim, self.M, faiss.METRIC_INNER_PRODUCT)
+                    index.hnsw.efConstruction = self.ef_construction
+                    index.hnsw.efSearch = self.ef_search
+                    self.vec_indices.append(index)
+            if self.training:
+                for i in range(batch_size):
+                    self.vec_indices[i].reset()
+            if not self.training and past_key_value is None:
+                for i in range(batch_size):
+                    self.vec_indices[i].reset()
+            output = faiss_block_attention(
+                                    xq, xk, xv,
+                                    dropout_p=dropout_p,
+                                    window_size=self.window_size,
+                                    block_size=self.block_size,
+                                    top_n=self.top_n,
+                                    vec_indices=self.vec_indices,
+                                    training=self.training,
+                                    )
+        elif self.flash and seq_len != 1:
             dropout_p = self.dropout if self.training else 0.0
             output = F.scaled_dot_product_attention(
                 xq, xk, xv,
@@ -119,7 +216,7 @@ class Attention(nn.Module):
             scores = self.attn_dropout(scores)
             output = scores @ xv
 
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = output.transpose(1, 2).reshape(batch_size, seq_len4q, -1)
         output = self.resid_dropout(self.wo(output))
         return output, past_kv
 
@@ -161,7 +258,7 @@ class MoEGate(nn.Module):
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
-        bsz, seq_len, h = hidden_states.shape
+        batch_size, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
@@ -178,12 +275,12 @@ class MoEGate(nn.Module):
         if self.training and self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
-            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            topk_idx_for_aux_loss = topk_idx.view(batch_size, -1)
             if self.seq_aux:
-                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                scores_for_seq_aux = scores_for_aux.view(batch_size, seq_len, -1)
+                ce = torch.zeros(batch_size, self.n_routed_experts, device=hidden_states.device)
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
-                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
+                                torch.ones(batch_size, seq_len * aux_topk, device=hidden_states.device)).div_(
                     seq_len * aux_topk / self.n_routed_experts)
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
@@ -212,7 +309,7 @@ class MOEFeedForward(nn.Module):
     def forward(self, x):
         identity = x
         orig_shape = x.shape
-        bsz, seq_len, _ = x.shape
+        batch_size, seq_len, _ = x.shape
         # 使用门控机制选择专家
         topk_idx, topk_weight, aux_loss = self.gate(x)
         x = x.view(-1, x.shape[-1])
@@ -305,10 +402,17 @@ class MiniMindLM(PreTrainedModel):
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 **args):
+        # Debug: verify autocasting
+        # if torch.is_autocast_enabled():
+        #     print("Autocast is enabled with dtype:", torch.get_autocast_gpu_dtype())
+        # else:
+        #     print("Autocast is NOT enabled")
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = args.get('start_pos', 0)
         h = self.dropout(self.tok_embeddings(input_ids))
-        pos_cis = self.pos_cis[start_pos:start_pos + input_ids.size(1)]
+        if input_ids.shape[1] == 1:
+            a = 10
+        pos_cis = self.pos_cis[start_pos:start_pos + input_ids.shape[1]]
         past_kvs = []
         for l, layer in enumerate(self.layers):
             h, past_kv = layer(

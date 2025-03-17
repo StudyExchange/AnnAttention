@@ -1,52 +1,3 @@
-# AnnAttention
-ANN Attention uses the HNSW algorithm to insert and query vectors organized in blocks when querying queries, achieving N * logN complexity and paving the way for LLM contexts of one billion tokens or even longer.
-
-
-## Features 😎
-- Use **faiss.IndexHNSWFlat** accelerates vector insertion and retrieval, reducing the computational complexity of long sequences.
-- By using **sliding window** and **block attention** mode, we avoid manipulating at every token, and instead only insert and retrieve block. This batch processing reduces the frequency of operations and increases processing efficiency.
-
-
-## Complexity
-| Mechanism              | Computational Complexity | Memory Complexity |
-|------------------------|--------------|----------|
-| **Standard Attention** | O(n^2)       | O(n^2)   |
-| **ANN Attention**      | O(n log n)   | O(n)     |
-
-
-## Quickstart 🚀
-- Download repository
-```
-git clone https://github.com/StudyExchange/AnnAttention.git
-```
-
-- Install pkgs
-```
-cd AnnAttention
-pip install -r requirements.txt
-```
-
-- Download datasets
-```
-modelscope download --dataset gongjy/minimind_dataset  pretrain_hq.jsonl    --local_dir ./dataset
-modelscope download --dataset gongjy/minimind_dataset sft_mini_512.jsonl    --local_dir ./dataset
-```
-
-- Run all
-```
-bash run_all.sh
-```
-
-
-## Training time
-Env: Intel i7-14700K, 128G, 4090D(24G)
-- Minimind(FlashAttention), training train_pretrain 2 epochs and train_full_sft 2 epochs takes about 4 hours.
-- AnnAttention, Training train_pretrain 2 epochs and train_full_sft 2 epochs takes about 4 days. Faiss calculates in CPU, it's too slow.
-
-
-## Core code
-faiss_block_attention.py
-```python
 import torch
 import torch.nn.functional as F
 import math
@@ -63,7 +14,11 @@ def select_block(xq, xk, xv, index, top_n, block_size, training):
     seq_len4v, head_dim = xv.shape
     nq = xq.cpu().detach().numpy()
     nk = xk.cpu().detach().numpy()
-
+    
+    if training:
+        a = 10
+    if not training:
+        a = 10
     selected_xk = []
     selected_xv = []
     for i in range(0, seq_len4k, block_size):
@@ -81,6 +36,8 @@ def select_block(xq, xk, xv, index, top_n, block_size, training):
             index.add(bk_mean)
     selected_xk_tensor = torch.concatenate(selected_xk, dim=0)
     selected_xv_tensor = torch.concatenate(selected_xv, dim=0)
+    if not selected_xv_tensor.shape[0]:
+        a = 10
     return selected_xk_tensor, selected_xv_tensor
 
 
@@ -89,15 +46,18 @@ def faiss_block_attention(hq, hk, hv, dropout_p: float = 0.0,
                            top_n: int = 8, training: bool=False, vec_indices: list = []):
     t0 = time.time()
     debug = False
+    # 获取基本张量尺寸
     batch_size, n_head, seq_len4q, head_dim = hq.shape
     batch_size, n_head, seq_len4k, head_dim = hk.shape
     batch_size, n_head, seq_len4v, head_dim = hk.shape
     embed_dim = n_head * head_dim
     
+    # 将 hq, hk, hv 变换为形状 [batch_size, seq_len, embed_dim] 便于后续处理
     xq = hq.transpose(1, 2).reshape(batch_size, seq_len4q, embed_dim)
     xk = hk.transpose(1, 2).reshape(batch_size, seq_len4k, embed_dim)
     xv = hv.transpose(1, 2).reshape(batch_size, seq_len4v, embed_dim)
 
+    # slidding_window
     t1 = time.time()
     xk_windows = sliding_window_with_padding(xk, window_size)
     xv_windows = sliding_window_with_padding(xv, window_size)
@@ -147,15 +107,8 @@ def faiss_block_attention(hq, hk, hv, dropout_p: float = 0.0,
     t_diff = time.time() - t0
     if debug:
         print(f'faiss_block_attention Function internal timing:{t_diff:.4f} s')
+    if training:
+        a = 10
+    if not training:
+        a = 10
     return output
-
-```
-
-
-## Thanks
-- [minimind](https://github.com/jingyaogong/minimind), peripheral code copy from this project.
-- [nanoGPT](https://github.com/karpathy/nanoGPT), start learning from this project.
-
-
-## License
-This repository is licensed under the Apache-2.0 License.
